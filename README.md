@@ -1,3 +1,3 @@
-# blink_2020_05
+# PlatformIO for blink_2020_05 board
 
-TODO - Fill this in
+Demo blink program for custom PCB with ATMEGA328P-AU and 3 LEDs. Used as a proof of concept for PCBs ordered from JLCPCB
