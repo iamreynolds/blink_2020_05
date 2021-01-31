@@ -52,9 +52,16 @@ void updateTemp(unsigned long loopMills);
 void writeEEPROM(unsigned int address, byte data);
 byte readEEPROM(unsigned int address);
 void eepromTest ();
-void espMon (unsigned int loopMills);
-void espInit (unsigned int loopMills);
-String espSendBlocking (String command, unsigned int timeout);
+
+// ESP V2
+boolean espMustBlock (unsigned long loopMills);
+boolean espReadyToWrite (unsigned long loopMills);
+boolean espWrite (unsigned long loopMills, String message);
+boolean espFailureFlush (unsigned long loopMills);
+boolean espFlushRead (unsigned long loopMills);
+boolean espReadReady (unsigned long loopMills);
+String espGetRead (unsigned long loopMills);
+
 
 //----------------------------------------
 // PIN DEFINITIONS
@@ -82,7 +89,7 @@ String espSendBlocking (String command, unsigned int timeout);
 
 int blinkLedState         = LOW;
 unsigned long blinkMills  = 0;
-const long blinkInterval = 1000;
+const long blinkInterval = 50;
 
 static int aState = LOW;
 static int bState = LOW;
@@ -98,17 +105,18 @@ static unsigned long aLastClick = 0;
 static unsigned long bLastClick = 0;
 static unsigned long cLastClick = 0;
 static unsigned long dLastClick = 0;
-const int repeatClick = 50;
+const int repeatClick = 200;
 
 double tempValue = 0;
 const int tempInterval = 50;
 unsigned long tempMills = 0;
 
-static unsigned long espSent = 0;
-static String espCmd = "";
-static String espRsp = "";
+//ESP V2
+static String espLastCommand = "";         //Last cmd sent
+static unsigned long espReadTimeout = 0;   // When to bail on reading an incoming message
+static unsigned long espTimeoutExpire = 0; // When a retry is allowed after a failed message
+static String espReadBuffer = "";          //Partial message from Serial
 
-static espState ESP_STATE = DISCONNECTED;
 
 //----------------------------------------
 //  LIB Init
@@ -129,14 +137,14 @@ void setup() {
   //Button
   pinMode(BUTTON_A, INPUT);
   pinMode(BUTTON_B, INPUT);
-  pinMode(BUTTON_D, INPUT);
   pinMode(BUTTON_C, INPUT);
+  pinMode(BUTTON_D, INPUT);
 
 
   //EEPROM
   Wire.begin();
 
-  eepromTest();
+  // eepromTest();
 
   Serial.begin(115200);
 }
@@ -144,7 +152,6 @@ void setup() {
 String oldText =  "";
 String newText =  "";
 
-String serialRead = "";
 String espDebug = "";
 
 const unsigned int testAddr = 0x00A1;
@@ -156,11 +163,17 @@ byte eePromRead = 0x00;
 
 void loop() {
   unsigned long loopMills = millis();
-  updateBlink(loopMills);
-  updateButtons(loopMills);
-  updateDisplay(loopMills);
-  updateTemp(loopMills);
-  espMon(loopMills);
+  if (espMustBlock(loopMills)) {
+    // ESP takes priority
+    espFlushRead(loopMills);
+  } else {
+    updateBlink(loopMills);
+    updateDisplay(loopMills);
+    updateTemp(loopMills);
+    // espMon(loopMills);
+    espFlushRead(loopMills);
+    updateButtons(loopMills);
+  }
 }
 
 void updateBlink (unsigned long loopMills) {
@@ -177,44 +190,37 @@ void updateBlink (unsigned long loopMills) {
 
 void updateDisplay(unsigned long loopMills) {
   newText = "";
-  newText += "Blink STATE: ";
-  newText += String(blinkLedState, DEC);
-  newText += "\n";
-  newText += "BUTTON_A: ";
-  newText += String(aState, DEC);
-  newText += " CK: ";
-  newText += String(aClicks, DEC);
-  newText += "\n";
-  newText += "BUTTON_B: ";
-  newText += String(bState, DEC);
-  newText += " CK: ";
-  newText += String(bClicks, DEC);
-  newText += "\n";
-  newText += "BUTTON_C: ";
-  newText += String(cState, DEC);
-  newText += " CK: ";
-  newText += String(cClicks, DEC);
-  newText += "\n";
-  newText += "BUTTON_D: ";
-  newText += String(dState, DEC);
-  newText += " CK: ";
-  newText += String(dClicks, DEC);
+  // newText += "Blink STATE: ";
+  // newText += String(blinkLedState, DEC);
+  // newText += "\n";
+  // newText += "BUTTON_A: ";
+  // newText += String(aState, DEC);
+  // newText += " CK: ";
+  // newText += String(aClicks, DEC);
+  // newText += "\n";
+  // newText += "BUTTON_B: ";
+  // newText += String(bState, DEC);
+  // newText += " CK: ";
+  // newText += String(bClicks, DEC);
+  // newText += "\n";
+  // newText += "BUTTON_C: ";
+  // newText += String(cState, DEC);
+  // newText += " CK: ";
+  // newText += String(cClicks, DEC);
+  // newText += "\n";
+  // newText += "BUTTON_D: ";
+  // newText += String(dState, DEC);
+  // newText += " CK: ";
+  // newText += String(dClicks, DEC);
 
-  newText += "\n";
-  newText += "TEMP: ";
-  newText += String(tempValue, 2);
+  // newText += "\n";
+  // newText += "TEMP: ";
+  // newText += String(tempValue, 2);
 
   newText += "\n";
   newText += "EEPROM: ";
   newText += String(eePromRead, HEX);
 
-
-  newText += "\n";
-  newText += "ESPSTATE: ";
-  newText += ESP_STATE;
-  newText += " -- (";
-  newText += Serial.available();
-  newText += ")";
   newText += "\n";
   newText += "ESP: ";
   newText += espDebug;
@@ -246,28 +252,67 @@ void updateButtons(unsigned long loopMills) {
   if (aState && loopMills > aLastClick + repeatClick) {
     aClicks++;
     aLastClick = loopMills;
-    espDebug = espSendBlocking("AT",1000);
+    if (espWrite(loopMills,"AT")) {
+      espDebug = "Wrote AT";
+    } else {
+      espDebug = "Write blocked\n";
+      espDebug += "lc =";
+      espDebug += espLastCommand;
+      espDebug += "\n";
+      espDebug += "rt =";
+      espDebug += espReadTimeout;
+      espDebug += "\n";
+      espDebug += "te =";
+      espDebug += espTimeoutExpire;
+      espDebug += "\n";
+      espDebug += "rb =";
+      espDebug += espReadBuffer;
+    }
   }
   //BUTTON_B
   if (bState && loopMills > bLastClick + repeatClick) {
     bClicks++;
     bLastClick = loopMills;
-    espDebug = espSendBlocking("AT+GMR",1000);
+    if (espWrite(loopMills,"AT+GMR")) {
+      espDebug = "Wrote AT+GMR";
+    } else {
+      espDebug = "Write blocked\n";
+      espDebug += "lc =";
+      espDebug += espLastCommand;
+      espDebug += "\n";
+      espDebug += "rt =";
+      espDebug += espReadTimeout;
+      espDebug += "\n";
+      espDebug += "te =";
+      espDebug += espTimeoutExpire;
+      espDebug += "\n";
+      espDebug += "rb =";
+      espDebug += espReadBuffer;
+    }
   }
   //BUTTON_C
   if (cState && loopMills > cLastClick + repeatClick) {
     cClicks++;
     cLastClick = loopMills;
-    espDebug = espSendBlocking("AT+RST",5000);
+    espDebug = espGetRead(loopMills);
   }
   //BUTTON_D
   if (dState && loopMills > dLastClick + repeatClick) {
     dClicks++;
     dLastClick = loopMills;
+
     espDebug = "";
-    while (Serial.available()) {
-      espDebug += (char)Serial.read();
-    }
+    espDebug += "lc =";
+    espDebug += espLastCommand;
+    espDebug += "\n";
+    espDebug += "rt =";
+    espDebug += espReadTimeout;
+    espDebug += "\n";
+    espDebug += "te =";
+    espDebug += espTimeoutExpire;
+    espDebug += "\n";
+    espDebug += "rb =";
+    espDebug += espReadBuffer;
   }
 }
 
@@ -308,101 +353,102 @@ void eepromTest () {
   eePromRead = readEEPROM(testAddr);
 }
 
-void espMon (unsigned int loopMills) {
-  switch (ESP_STATE) {
-    case IDLE:
-      // espDebug = "idle";
-      break;
-    case DELAY:
-      // espDebug = "delay";
-      break;
-    case WAITING_LOCAL:
-      // espDebug = "localWait";
-      break;
-    case WAITING_REMOTE:
-      // espDebug = "remoteWait";
-      break;
-    case DISCONNECTED:
-      // espDebug = "discon";
-      break;
-    case FAILED:
-      // espDebug = "failed";
-      break;
-    case LOWPOWER:
-      // espDebug = "lowPow";
-      break;
-  }
-}
-
-void espInit (unsigned int loopMills) {
-  if (ESP_STATE != DISCONNECTED) {
-    espDebug = "INIT_DUPP_RUNNING";
-    return;
-  }
-  Serial.println("AT");
-
-  while (!Serial.available() && millis() - loopMills < 1000) {
-    delay(1);
-  }
-  if (Serial.available()) {
-    espDebug = "";
-    while (Serial.available()) {
-      espDebug += char(Serial.read());
-    }
-    ESP_STATE = IDLE;
+boolean espMustBlock (unsigned long loopMills) {
+  if (espReadTimeout > loopMills) {
+    return true;
   } else {
-    espDebug = "TIMEOUT";
+    return false;
   }
 }
 
-String espSendBlocking (String command, unsigned int timeout) {
-  if (Serial.available()) {
-    return "NOT_READY";
+boolean espReadyToWrite (unsigned long loopMills) {
+  if (espReadTimeout > loopMills) {
+    //Still waiting to read
+    return false;
+  }
+  if (espTimeoutExpire > loopMills) {
+    //Still waiting for timout delay to expire
+    return false;
   }
 
-  Serial.println(command);
-  unsigned long sentTime = millis();
-  String result = "";
-  while (!Serial.available() && millis() - sentTime < timeout) {
-    delay(10);
+  if (espReadTimeout != 0 && espReadTimeout < loopMills) {
+    //Failed read, need to clear.
+    espFailureFlush(loopMills);
+    return espReadyToWrite (loopMills);
   }
-  if (Serial.available()) {
-    result = "";
-    int line = 0;
-    unsigned long lastRead = millis();
-    while (Serial.available() || millis() - lastRead < timeout) {
-      if (Serial.available()) {
-        unsigned int lastRead = millis();
-        char readChar = Serial.read();
-        int readInt = (int)readChar;
-        if (readInt >= 32 && readInt <= 126) {
-          result += readChar;
-        } else {
-          result += ">";
-          result += readInt;
-          result += "<";
-        }
+
+  if (espTimeoutExpire < loopMills) {
+    // Clear out anything in the read buffer
+    espFailureFlush(loopMills);
+    espTimeoutExpire = 0;
+
+    // All clear to try again
+    return true;
+  }
+}
+
+boolean espWrite (unsigned long loopMills, String message) {
+  if (espReadyToWrite(loopMills)) {
+    espLastCommand = message;
+    Serial.println(message);
+    espReadTimeout = loopMills + 2000;
+    espTimeoutExpire = 0;
+    return true;
+  }
+  return false;
+}
+
+boolean espFailureFlush (unsigned long loopMills) {
+  espLastCommand = "";
+  espReadTimeout = 0;
+  espTimeoutExpire = loopMills + 1000;
+  espReadBuffer = "";
+  while (Serial.available()) {
+    Serial.read();
+  }
+  return true;
+}
+
+
+boolean espFlushRead (unsigned long loopMills) {
+  // TODO - count the lines
+  if (espLastCommand != "") {
+    if (Serial.available() > 50) {
+      espReadBuffer += "!";
+    }
+    while (Serial.available()) {
+      char readChar = Serial.read();
+      int readInt = (int)readChar;
+      if (readInt >= 32 && readInt <= 126) {
+        espReadBuffer += readChar;
+      } else {
+        espReadBuffer += "{";
+        espReadBuffer += readInt;
+        espReadBuffer += "}";
       }
     }
-  } else {
-    ESP_STATE = TIMEOUT;
-    result = "LOCAL_ERROR";
-    result += "/";
-    result += millis();
-    result += "/";
-    result += sentTime;
   }
-  return result;
 }
 
-String espCommand (espCMD command) {
-  String response = "";
-  switch (command) {
-    case AT:
-      response = espSendBlocking("AT",1000);
-      break;
-    case AT_GMT:
-      break;
+boolean espReadReady (unsigned long loopMills) {
+  if (espLastCommand != "" && espReadTimeout < loopMills) {
+    return true;
   }
-  return response;
+  return false;
+}
+
+String espGetRead (unsigned long loopMills) {
+  if (!espReadReady(loopMills)) {
+    if (espLastCommand == "") {
+      return "ERROR: No Command sent";
+    } else {
+      String result = "ERROR: read ready in ";
+      result += espReadTimeout - loopMills;
+      result += "seconds";
+      return result;
+    }
+  }
+  espTimeoutExpire = loopMills + 500;
+  espLastCommand = "";
+  return espReadBuffer;
 }
